@@ -127,6 +127,17 @@ body {
   border-color: #c73836;
 }
 
+.button.secondary {
+  background-color: #ffffff;
+  color: #656d76;
+  border: 1px solid #d0d7de;
+}
+
+.button.secondary:hover {
+  background-color: #f6f8fa;
+  border-color: #c9d1d9;
+}
+
 /* Tab selection */
 .tab-section-title {
   padding-left: 12px;

@@ -29,12 +29,17 @@ type PageMessage = {
 } | {
   type: 'getConnectionStatus';
 } | {
+  type: 'getAllConnections';
+} | {
   type: 'disconnect';
+  tabId?: number; // Optional: disconnect specific tab, or all if not provided
 };
 
 class TabShareExtension {
-  private _activeConnection: RelayConnection | undefined;
-  private _connectedTabId: number | null = null;
+  // Map of tabId -> active connection (supports multiple simultaneous tabs)
+  private _activeConnections = new Map<number, RelayConnection>();
+  // Legacy: for backwards compatibility, track the most recently connected tab
+  private _lastConnectedTabId: number | null = null;
   private _pendingTabSelection = new Map<number, { connection: RelayConnection, timerId?: number }>();
 
   constructor() {
@@ -62,16 +67,25 @@ class TabShareExtension {
         const tabId = message.tabId || sender.tab?.id!;
         const windowId = message.windowId || sender.tab?.windowId!;
         this._connectTab(sender.tab!.id!, tabId, windowId, message.mcpRelayUrl!).then(
-            () => sendResponse({ success: true }),
+            () => sendResponse({ success: true, tabId }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true; // Return true to indicate that the response will be sent asynchronously
       case 'getConnectionStatus':
+        // Legacy: return the last connected tab for backwards compatibility
         sendResponse({
-          connectedTabId: this._connectedTabId
+          connectedTabId: this._lastConnectedTabId,
+          // Also include all connected tabs
+          connectedTabIds: Array.from(this._activeConnections.keys())
+        });
+        return false;
+      case 'getAllConnections':
+        // New: return all active connections
+        sendResponse({
+          connections: Array.from(this._activeConnections.keys()).map(tabId => ({ tabId }))
         });
         return false;
       case 'disconnect':
-        this._disconnect().then(
+        this._disconnect(message.tabId).then(
             () => sendResponse({ success: true }),
             (error: any) => sendResponse({ success: false, error: error.message }));
         return true;
@@ -107,45 +121,59 @@ class TabShareExtension {
   private async _connectTab(selectorTabId: number, tabId: number, windowId: number, mcpRelayUrl: string): Promise<void> {
     try {
       debugLog(`Connecting tab ${tabId} to relay at ${mcpRelayUrl}`);
-      try {
-        this._activeConnection?.close('Another connection is requested');
-      } catch (error: any) {
-        debugLog(`Error closing active connection:`, error);
-      }
-      await this._setConnectedTabId(null);
 
-      this._activeConnection = this._pendingTabSelection.get(selectorTabId)?.connection;
-      if (!this._activeConnection)
+      // Check if this tab already has an active connection
+      const existingConnection = this._activeConnections.get(tabId);
+      if (existingConnection) {
+        try {
+          existingConnection.close('New connection requested for this tab');
+        } catch (error: any) {
+          debugLog(`Error closing existing connection for tab ${tabId}:`, error);
+        }
+        this._activeConnections.delete(tabId);
+        await this._updateBadge(tabId, { text: '' });
+      }
+
+      const pendingConnection = this._pendingTabSelection.get(selectorTabId)?.connection;
+      if (!pendingConnection)
         throw new Error('No active MCP relay connection');
       this._pendingTabSelection.delete(selectorTabId);
 
-      this._activeConnection.setTabId(tabId);
-      this._activeConnection.onclose = () => {
-        debugLog('MCP connection closed');
-        this._activeConnection = undefined;
-        void this._setConnectedTabId(null);
+      pendingConnection.setTabId(tabId);
+      pendingConnection.onclose = () => {
+        debugLog(`MCP connection closed for tab ${tabId}`);
+        this._activeConnections.delete(tabId);
+        void this._removeConnectedTab(tabId);
       };
 
+      // Add to active connections map
+      this._activeConnections.set(tabId, pendingConnection);
+      this._lastConnectedTabId = tabId;
+
       await Promise.all([
-        this._setConnectedTabId(tabId),
+        this._addConnectedTab(tabId),
         chrome.tabs.update(tabId, { active: true }),
         chrome.windows.update(windowId, { focused: true }),
       ]);
-      debugLog(`Connected to MCP bridge`);
+      debugLog(`Connected to MCP bridge for tab ${tabId}. Total active connections: ${this._activeConnections.size}`);
     } catch (error: any) {
-      await this._setConnectedTabId(null);
+      await this._removeConnectedTab(tabId);
       debugLog(`Failed to connect tab ${tabId}:`, error.message);
       throw error;
     }
   }
 
-  private async _setConnectedTabId(tabId: number | null): Promise<void> {
-    const oldTabId = this._connectedTabId;
-    this._connectedTabId = tabId;
-    if (oldTabId && oldTabId !== tabId)
-      await this._updateBadge(oldTabId, { text: '' });
-    if (tabId)
-      await this._updateBadge(tabId, { text: '✓', color: '#4CAF50', title: 'Connected to MCP client' });
+  private async _addConnectedTab(tabId: number): Promise<void> {
+    await this._updateBadge(tabId, { text: '✓', color: '#4CAF50', title: 'Connected to MCP client' });
+  }
+
+  private async _removeConnectedTab(tabId: number): Promise<void> {
+    await this._updateBadge(tabId, { text: '' });
+    // Update lastConnectedTabId if this was the last connected tab
+    if (this._lastConnectedTabId === tabId) {
+      const remainingTabs = Array.from(this._activeConnections.keys());
+      this._lastConnectedTabId = remainingTabs.length > 0 ? remainingTabs[remainingTabs.length - 1] : null;
+    }
   }
 
   private async _updateBadge(tabId: number, { text, color, title }: { text: string; color?: string, title?: string }): Promise<void> {
@@ -160,17 +188,21 @@ class TabShareExtension {
   }
 
   private async _onTabRemoved(tabId: number): Promise<void> {
+    // Check pending connections first
     const pendingConnection = this._pendingTabSelection.get(tabId)?.connection;
     if (pendingConnection) {
       this._pendingTabSelection.delete(tabId);
       pendingConnection.close('Browser tab closed');
       return;
     }
-    if (this._connectedTabId !== tabId)
-      return;
-    this._activeConnection?.close('Browser tab closed');
-    this._activeConnection = undefined;
-    this._connectedTabId = null;
+
+    // Check active connections
+    const activeConnection = this._activeConnections.get(tabId);
+    if (activeConnection) {
+      activeConnection.close('Browser tab closed');
+      this._activeConnections.delete(tabId);
+      await this._removeConnectedTab(tabId);
+    }
   }
 
   private _onTabActivated(activeInfo: chrome.tabs.TabActiveInfo) {
@@ -196,8 +228,9 @@ class TabShareExtension {
   }
 
   private _onTabUpdated(tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) {
-    if (this._connectedTabId === tabId)
-      void this._setConnectedTabId(tabId);
+    // Update badge for any connected tab
+    if (this._activeConnections.has(tabId))
+      void this._addConnectedTab(tabId);
   }
 
   private async _getTabs(): Promise<chrome.tabs.Tab[]> {
@@ -212,10 +245,24 @@ class TabShareExtension {
     });
   }
 
-  private async _disconnect(): Promise<void> {
-    this._activeConnection?.close('User disconnected');
-    this._activeConnection = undefined;
-    await this._setConnectedTabId(null);
+  private async _disconnect(tabId?: number): Promise<void> {
+    if (tabId !== undefined) {
+      // Disconnect specific tab
+      const connection = this._activeConnections.get(tabId);
+      if (connection) {
+        connection.close('User disconnected');
+        this._activeConnections.delete(tabId);
+        await this._removeConnectedTab(tabId);
+      }
+    } else {
+      // Disconnect all tabs
+      for (const [connectedTabId, connection] of this._activeConnections) {
+        connection.close('User disconnected');
+        await this._removeConnectedTab(connectedTabId);
+      }
+      this._activeConnections.clear();
+      this._lastConnectedTabId = null;
+    }
   }
 }
 
