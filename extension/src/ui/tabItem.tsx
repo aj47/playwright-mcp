@@ -24,7 +24,7 @@ export interface TabInfo {
   favIconUrl?: string;
 }
 
-export const Button: React.FC<{ variant: 'primary' | 'default' | 'reject'; onClick: () => void; children: React.ReactNode }> = ({
+export const Button: React.FC<{ variant: 'primary' | 'default' | 'reject' | 'secondary'; onClick: () => void; children: React.ReactNode }> = ({
   variant,
   onClick,
   children
